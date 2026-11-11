@@ -3,6 +3,7 @@ package client
 import (
 	"crypto/tls"
 	"errors"
+	"sync"
 
 	"github.com/go-resty/resty/v2"
 )
@@ -39,6 +40,10 @@ type FAClient struct {
 	XAuthToken string
 	XRequestID string
 	Error      error
+
+	// mu guards XAuthToken and Error, which RefreshSession updates while
+	// collectors are issuing requests concurrently.
+	mu sync.Mutex
 }
 
 func NewRestClient(endpoint string, apitoken string, apiversion string, uagent string, rid string, debug bool, secure bool) *FAClient {
@@ -65,6 +70,14 @@ func NewRestClient(endpoint string, apitoken string, apiversion string, uagent s
 	if debug {
 		fa.RestClient.SetDebug(true)
 	}
+	// Set the session token per request rather than with RestClient.SetHeader:
+	// resty reads the client-wide header map without locking on every request.
+	fa.RestClient.OnBeforeRequest(func(_ *resty.Client, r *resty.Request) error {
+		if token := fa.authToken(); token != "" {
+			r.Header.Set("x-auth-token", token)
+		}
+		return nil
+	})
 	//	fa.RestClient.OnRequestLog(func(rl *resty.RequestLog) error {
 	//		fmt.Fprintln(os.Stderr, rl)
 	//		return nil
@@ -106,20 +119,32 @@ func NewRestClient(endpoint string, apitoken string, apiversion string, uagent s
 		return fa
 	}
 	fa.XAuthToken = res.Header().Get("x-auth-token")
-	fa.RestClient.SetHeader("x-auth-token", fa.XAuthToken)
 	return fa
 }
 
+func (fa *FAClient) authToken() string {
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
+	return fa.XAuthToken
+}
+
+func (fa *FAClient) setError(err error) {
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
+	fa.Error = err
+}
+
 func (fa *FAClient) Close() *FAClient {
-	if fa.XAuthToken == "" {
+	token := fa.authToken()
+	if token == "" {
 		return fa
 	}
 	_, err := fa.RestClient.R().
-		SetHeader("x-auth-token", fa.XAuthToken).
+		SetHeader("x-auth-token", token).
 		SetHeader("X-Request-ID", fa.XRequestID).
 		Post("/logout")
 	if err != nil {
-		fa.Error = err
+		fa.setError(err)
 	}
 	return fa
 }
@@ -130,10 +155,11 @@ func (fa *FAClient) RefreshSession() *FAClient {
 		SetHeader("X-Request-ID", fa.XRequestID).
 		Post("/login")
 	if err != nil {
-		fa.Error = err
+		fa.setError(err)
 		return fa
 	}
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
 	fa.XAuthToken = res.Header().Get("x-auth-token")
-	fa.RestClient.SetHeader("x-auth-token", fa.XAuthToken)
 	return fa
 }
